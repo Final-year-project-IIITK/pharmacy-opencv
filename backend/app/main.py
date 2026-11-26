@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import time
+
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.api.routes import router
+from app.api.extensions import router as extensions_router
+from app.api.vision import router as vision_router
+from app.core.config import get_settings
+from app.db.base import Base
+from app.db.session import engine, get_db
+from app.models import entities  # noqa: F401  # ensure model registration
+from app.services.seed import seed_demo_data
+
+settings = get_settings()
+app = FastAPI(title=settings.app_name, version="1.0.0")
+
+
+@app.middleware("http")
+async def add_response_time_header(request: Request, call_next) -> Response:
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.3f}"
+    return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router, prefix=settings.api_prefix)
+app.include_router(extensions_router, prefix=settings.api_prefix)
+app.include_router(vision_router, prefix=settings.api_prefix)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    if settings.environment.lower() in {"production", "prod"} and (
+        settings.secret_key == "dev-pharmacy-secret-key" or len(settings.secret_key) < 32
+    ):
+        raise RuntimeError("Production requires a SECRET_KEY with at least 32 characters.")
+    Base.metadata.create_all(bind=engine)
+    # Lightweight compatibility migration for existing demonstration databases.
+    columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    with engine.begin() as connection:
+        if "email" not in columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(128)"))
+        if "pharmacy_id" not in columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN pharmacy_id INTEGER"))
+        if "active" not in columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN active BOOLEAN NOT NULL DEFAULT 1"))
+    batch_columns = {column["name"] for column in inspect(engine).get_columns("batch_stocks")}
+    with engine.begin() as connection:
+        if "unit_price" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN unit_price FLOAT NOT NULL DEFAULT 50"))
+        if "recovery_unit_price" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN recovery_unit_price FLOAT NOT NULL DEFAULT 0"))
+        if "disposal_status" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN disposal_status VARCHAR(32) NOT NULL DEFAULT 'active'"))
+        if "disposal_method" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN disposal_method VARCHAR(64)"))
+        if "disposal_reference" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN disposal_reference VARCHAR(64)"))
+        if "disposed_on" not in batch_columns:
+            connection.execute(text("ALTER TABLE batch_stocks ADD COLUMN disposed_on DATE"))
+    medicine_columns = {column["name"] for column in inspect(engine).get_columns("medicines")}
+    if "pharmacy_id" not in medicine_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE medicines ADD COLUMN pharmacy_id INTEGER"))
+    with engine.begin() as connection:
+        pharmacy_columns = {column["name"] for column in inspect(engine).get_columns("pharmacies")}
+        if "country" not in pharmacy_columns:
+            connection.execute(text("ALTER TABLE pharmacies ADD COLUMN country VARCHAR(64)"))
+        if "active" not in pharmacy_columns:
+            connection.execute(text("ALTER TABLE pharmacies ADD COLUMN active BOOLEAN NOT NULL DEFAULT 1"))
+        medicine_columns = {column["name"] for column in inspect(engine).get_columns("medicines")}
+        if "reference_source" not in medicine_columns:
+            connection.execute(text("ALTER TABLE medicines ADD COLUMN reference_source VARCHAR(128)"))
+        po_columns = {column["name"] for column in inspect(engine).get_columns("purchase_orders")}
+        if "pharmacy_id" not in po_columns:
+            connection.execute(text("ALTER TABLE purchase_orders ADD COLUMN pharmacy_id INTEGER"))
+        request_columns = {column["name"] for column in inspect(engine).get_columns("procurement_requests")}
+        if "pharmacy_id" not in request_columns:
+            connection.execute(text("ALTER TABLE procurement_requests ADD COLUMN pharmacy_id INTEGER"))
+        sales_columns = {column["name"] for column in inspect(engine).get_columns("sale_invoices")}
+        if "pharmacy_id" not in sales_columns:
+            connection.execute(text("ALTER TABLE sale_invoices ADD COLUMN pharmacy_id INTEGER"))
+        if "customer_id" not in sales_columns:
+            connection.execute(text("ALTER TABLE sale_invoices ADD COLUMN customer_id INTEGER"))
+        supplier_columns = {column["name"] for column in inspect(engine).get_columns("suppliers")}
+        if "waste_vendor" not in supplier_columns:
+            connection.execute(text("ALTER TABLE suppliers ADD COLUMN waste_vendor BOOLEAN NOT NULL DEFAULT 0"))
+        if "waste_license_number" not in supplier_columns:
+            connection.execute(text("ALTER TABLE suppliers ADD COLUMN waste_license_number VARCHAR(64)"))
+        audit_columns = {column["name"] for column in inspect(engine).get_columns("audit_logs")}
+        if "pharmacy_id" not in audit_columns:
+            connection.execute(text("ALTER TABLE audit_logs ADD COLUMN pharmacy_id INTEGER"))
+        connection.execute(
+            text(
+                "UPDATE audit_logs SET pharmacy_id = "
+                "(SELECT pharmacy_id FROM users WHERE users.username = audit_logs.actor_username) "
+                "WHERE pharmacy_id IS NULL"
+            )
+        )
+    db = next(get_db())
+    try:
+        seed_demo_data(db)
+    finally:
+        db.close()
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except SQLAlchemyError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable") from error
+    return {"status": "ok", "database": "ok"}

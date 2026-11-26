@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+.env
+.venv/
+node_modules/
+dist/
+build/
+coverage/
+.DS_Store
+.vscode/.ropeproject/
+backups/
+/runs/
+/yolov8n.pt
